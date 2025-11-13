@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RF Outdoor Link Planner Tool</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html,body,#map { height:100%; margin:0; padding:0 }
+    body { font-family:system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial }
+    #toolbar { position: absolute; left:10px; top:10px; z-index:1000; background:rgba(255,255,255,0.95); padding:8px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.15); max-width: calc(100vw - 20px); box-sizing: border-box; }
+    #toolbar h3{ margin:0 0 6px 0; font-size:14px }
+    .btn { display:inline-block; padding:6px 8px; margin:4px 2px; border-radius:6px; cursor:pointer; background:#1976d2; color:white; font-size:13px; white-space: nowrap; }
+    .btn.secondary { background:#666 }
+    .info { font-size:13px; margin-top:6px; word-wrap: break-word; }
+    .legend { font-size:12px; line-height:1.4; }
+    .tower-label { font-weight:700 }
+    .popup-row { margin:4px 0 }
+    svg.fresnel { pointer-events:none }
+
+    /* Tablet responsiveness */
+    @media (max-width: 1024px) {
+      #toolbar { left:5px; top:5px; padding:6px; }
+      #toolbar h3 { font-size:13px; }
+      .btn { padding:5px 6px; font-size:12px; margin:3px 1px; }
+      .info { font-size:12px; }
+      .legend { font-size:11px; }
+    }
+
+    /* Mobile responsiveness (if needed, though primarily desktop/tablet) */
+    @media (max-width: 768px) {
+      #toolbar { position: relative; left: auto; top: auto; margin: 10px; width: calc(100% - 20px); }
+      .btn { display: block; width: 100%; margin: 4px 0; }
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="toolbar">
+    <h3>RF Link Planner</h3>
+    <div>
+      <button id="clearAll" class="btn secondary">Clear All</button>
+      <button id="sampleTowers" class="btn">Add Sample Towers</button>
+    </div>
+    <div class="info legend">Instructions: click map to add tower (auto-links to previous if same freq). Click a tower then another to link manually (must match frequency). Click a link to show Fresnel zone. Right-click tower or link to remove. Press ESC to cancel link selection.</div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+  // Single-file RF Link Planner (vanilla JS + Leaflet)
+  // Improved: when selecting first tower for a link, only compatible towers are highlighted as connectable and incompatible towers are visually dimmed.
+
+  const c = 3e8; // speed of light
+
+  const map = L.map('map').setView([20.5937,78.9629], 5); // default to India; change as desired
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+  // state
+  const towers = new Map(); // id -> {id, marker, freqGHz, latlng}
+  const links = new Map();  // id -> {id, aId, bId, polyline, svgEllipseElement, distanceLabel}
+  let nextTowerId = 1;
+  let nextLinkId = 1;
+  let linkStart = null; // tower id selected to start link
+  let lastTowerId = null; // track last added tower for auto-linking
+
+  // SVG overlay for fresnel ellipses
+  const svgLayer = L.svg().addTo(map);
+  const svgRoot = svgLayer._rootGroup; // SVG g element
+
+  function addTower(latlng, freqGHz = 5) {
+    const id = 'T' + nextTowerId++;
+    const marker = L.circleMarker(latlng, { radius:8, fillColor:'#ff5722', color:'#b03e1e', weight:1, fillOpacity:1 }).addTo(map);
+    marker.bindTooltip(`${id} — ${freqGHz} GHz`, {permanent:true, direction:'right', offset:[8,0]}).openTooltip();
+
+    marker.on('click', (e) => onTowerClick(id));
+    marker.on('contextmenu', (e) => removeTower(id));
+
+    const tower = { id, marker, freqGHz: Number(freqGHz), latlng };
+    towers.set(id, tower);
+
+    marker.bindPopup(makeTowerPopupContent(id));
+
+    // Auto-link to last tower if frequencies match
+    if (lastTowerId) {
+      const lastTower = towers.get(lastTowerId);
+      if (lastTower && Math.abs(lastTower.freqGHz - tower.freqGHz) <= 1e-6) {
+        createLink(lastTower, tower);
+      }
+    }
+    lastTowerId = tower.id;
+
+    return tower;
+  }
+
+  function makeTowerPopupContent(id) {
+    const t = towers.get(id);
+    const container = document.createElement('div');
+    container.innerHTML = `
+      <div class="popup-row"><b>${id}</b></div>
+      <div class="popup-row">Frequency (GHz): <input id="freq-${id}" type="number" step="0.1" value="${t.freqGHz}" style="width:80px"/></div>
+      <div style="margin-top:6px"><button id="save-${id}" class="btn">Save</button> <button id="close-${id}" class="btn secondary">Close</button></div>
+    `;
+    // attach handlers after popup is opened
+    setTimeout(() => {
+      const save = document.getElementById('save-' + id);
+      if (save) save.onclick = () => {
+        const v = parseFloat(document.getElementById('freq-' + id).value) || t.freqGHz;
+        t.freqGHz = v;
+        t.marker.setTooltipContent(`${id} — ${t.freqGHz} GHz`);
+        t.marker.closePopup();
+      };
+      const close = document.getElementById('close-' + id);
+      if (close) close.onclick = () => t.marker.closePopup();
+    }, 50);
+
+    return container;
+  }
+
+  function onTowerClick(id) {
+    // If no start selected -> set as start
+    if (!linkStart) { setLinkStart(id); return; }
+
+    // If clicked same as start -> cancel
+    if (linkStart === id) { clearLinkStart(); return; }
+
+    const a = towers.get(linkStart);
+    const b = towers.get(id);
+    if (!a || !b) { clearLinkStart(); return; }
+
+    // constraint: same freq
+    if (Math.abs(a.freqGHz - b.freqGHz) > 1e-6) {
+      // user tried to click an incompatible tower: provide friendly feedback and keep selection so they may choose another
+      alert('Cannot connect towers with different frequencies (GHz).\nPlease set both towers to the same frequency or choose a different tower.');
+      return;
+    }
+
+    createLink(a, b);
+    clearLinkStart();
+  }
+
+  function setLinkStart(id) {
+    linkStart = id;
+    // visually indicate selection and which towers are compatible
+    for (let [tid, t] of towers.entries()) {
+      if (tid === id) {
+        t.marker.setStyle({ radius:11, weight:2, color:'#004d40', fillColor:'#26a69a' });
+      } else if (Math.abs(t.freqGHz - towers.get(id).freqGHz) <= 1e-6) {
+        // compatible
+        t.marker.setStyle({ radius:9, weight:1, color:'#2e7d32', fillColor:'#66bb6a', fillOpacity:0.9 });
+      } else {
+        // incompatible - dim
+        t.marker.setStyle({ radius:7, weight:1, color:'#9e9e9e', fillColor:'#bdbdbd', fillOpacity:0.5 });
+      }
+    }
+    // hint to user
+    alert(`Selected ${id} as link start (frequency: ${towers.get(id).freqGHz} GHz). Now click a compatible tower to connect, or press ESC to cancel.`);
+  }
+
+  function clearLinkStart() {
+    // restore default styles
+    for (let [tid, t] of towers.entries()) {
+      t.marker.setStyle({ radius:8, fillColor:'#ff5722', color:'#b03e1e', weight:1, fillOpacity:1 });
+    }
+    linkStart = null;
+  }
+
+  function createLink(a, b) {
+    const id = 'L' + nextLinkId++;
+    const latlngs = [a.latlng, b.latlng];
+    const poly = L.polyline(latlngs, { color:'#00ff00', weight:4, opacity:1 }).addTo(map);
+    poly.on('click', () => onLinkClick(id));
+    poly.on('contextmenu', () => removeLink(id));
+    poly.on('mouseover', (e) => showLinkTooltip(e, id));
+    poly.on('mouseout', hideTooltip);
+
+    // Create permanent distance label at midpoint
+    const dist = map.distance(a.latlng, b.latlng);
+    const midLatLng = L.latLng((a.latlng.lat + b.latlng.lat)/2, (a.latlng.lng + b.latlng.lng)/2);
+    const distanceLabel = L.marker(midLatLng, {
+      icon: L.divIcon({
+        className: 'distance-label',
+        html: `<div style="background: rgba(255,255,255,0.9); border: 1px solid #333; border-radius: 4px; padding: 2px 4px; font-size: 11px; font-weight: bold; color: #000; white-space: nowrap;">${Math.round(dist)} m</div>`,
+        iconSize: [60, 20],
+        iconAnchor: [30, 10]
+      })
+    }).addTo(map);
+
+    const link = { id, aId: a.id, bId: b.id, polyline: poly, svgEllipseElement: null, distanceLabel };
+    links.set(id, link);
+
+    // Update label position on zoom/move
+    const updateLabelPosition = () => {
+      const newMid = L.latLng((a.latlng.lat + b.latlng.lat)/2, (a.latlng.lng + b.latlng.lng)/2);
+      distanceLabel.setLatLng(newMid);
+    };
+    map.on('zoom move', updateLabelPosition);
+    link._updateLabelPosition = updateLabelPosition;
+
+    // attempt to fetch elevation samples (best-effort)
+    fetchElevations(a.latlng, b.latlng).then(elevs => {
+      link.elevations = elevs;
+    }).catch(err => {/* ignore */});
+
+    return link;
+  }
+
+  function removeTower(id) {
+    const t = towers.get(id);
+    if (!t) return;
+    // remove any links connected
+    for (let [lid, link] of Array.from(links)) {
+      if (link.aId === id || link.bId === id) removeLink(lid);
+    }
+    map.removeLayer(t.marker);
+    towers.delete(id);
+    // if it was the start, clear selection
+    if (linkStart === id) clearLinkStart();
+  }
+
+  function removeLink(id) {
+    const link = links.get(id);
+    if (!link) return;
+    map.removeLayer(link.polyline);
+    if (link.svgEllipseElement) link.svgEllipseElement.remove();
+    if (link.distanceLabel) map.removeLayer(link.distanceLabel);
+    links.delete(id);
+  }
+
+  function onLinkClick(id) {
+    const link = links.get(id);
+    if (!link) return;
+    // toggle fresnel: remove existing, else draw
+    if (link.svgEllipseElement) { link.svgEllipseElement.remove(); link.svgEllipseElement = null; return; }
+    drawFresnelForLink(link);
+  }
+
+  function showLinkTooltip(e, id) {
+    const link = links.get(id);
+    if (!link) return;
+    const a = towers.get(link.aId);
+    const b = towers.get(link.bId);
+    const dist = map.distance(a.latlng, b.latlng);
+    const txt = `Freq: ${a.freqGHz} GHz • Distance: ${Math.round(dist)} m`;
+    const tip = L.popup({ autoPan:false, closeButton:false, offset:[0,-10] }).setLatLng(e.latlng).setContent(txt).openOn(map);
+    setTimeout(() => { map.closePopup(tip); }, 1200);
+  }
+  function hideTooltip() { /* noop */ }
+
+  // Fresnel calculation & simple ellipse drawing
+  function drawFresnelForLink(link) {
+    const a = towers.get(link.aId);
+    const b = towers.get(link.bId);
+    if (!a || !b) return;
+    const freqHz = a.freqGHz * 1e9;
+    const lambda = c / freqHz;
+
+    // We'll compute radius at midpoint (d1=d2=distance/2) to generate a simple ellipse
+    const dist = map.distance(a.latlng, b.latlng); // meters
+    const d1 = dist/2, d2 = dist/2;
+    const rMid = Math.sqrt((lambda * d1 * d2) / (d1 + d2)); // meters
+
+    // ellipse major axis = link length, minor axis = 2 * rMid (simplification)
+    const major = dist;
+    const minor = 2 * rMid;
+
+    // convert latlng to layer points for pixel positions
+    const pA = map.latLngToLayerPoint(a.latlng);
+    const pB = map.latLngToLayerPoint(b.latlng);
+
+    const cx = (pA.x + pB.x)/2, cy = (pA.y + pB.y)/2;
+    const angle = Math.atan2(pB.y - pA.y, pB.x - pA.x) * 180 / Math.PI;
+
+    // create an SVG ellipse element sized in pixels: approximate meters->pixels at current zoom
+    const oneMeterLatLng = destinationLatLng(a.latlng, 0.0000089); // ~1m approx (very rough)
+    const pOneMeter = map.latLngToLayerPoint(oneMeterLatLng);
+    const meterPx = Math.abs(pOneMeter.y - map.latLngToLayerPoint(a.latlng).y) || 1;
+
+    const rx = (major/2) * meterPx; // semi-major in px
+    const ry = (minor/2) * meterPx; // semi-minor in px
+
+    const svgns = 'http://www.w3.org/2000/svg';
+    const ellipse = document.createElementNS(svgns, 'ellipse');
+    ellipse.setAttribute('cx', cx);
+    ellipse.setAttribute('cy', cy);
+    ellipse.setAttribute('rx', rx);
+    ellipse.setAttribute('ry', ry);
+    ellipse.setAttribute('transform', `rotate(${angle} ${cx} ${cy})`);
+    ellipse.setAttribute('fill', 'rgba(25,118,210,0.12)');
+    ellipse.setAttribute('stroke', 'rgba(25,118,210,0.6)');
+    ellipse.setAttribute('stroke-width', 1.5);
+    ellipse.classList.add('fresnel');
+
+    svgRoot.appendChild(ellipse);
+    link.svgEllipseElement = ellipse;
+
+    // keep ellipse in sync when map moves/zooms
+    const onViewReset = () => {
+      if (!link.svgEllipseElement) return;
+      const pA = map.latLngToLayerPoint(a.latlng);
+      const pB = map.latLngToLayerPoint(b.latlng);
+      const cx = (pA.x + pB.x)/2, cy = (pA.y + pB.y)/2;
+      const angle = Math.atan2(pB.y - pA.y, pB.x - pA.x) * 180 / Math.PI;
+      const oneMeterLatLng = destinationLatLng(a.latlng, 0.0000089);
+      const pOneMeter = map.latLngToLayerPoint(oneMeterLatLng);
+      const meterPx = Math.abs(pOneMeter.y - map.latLngToLayerPoint(a.latlng).y) || 1;
+      const rx = (dist/2) * meterPx;
+      const ry = (minor/2) * meterPx;
+      link.svgEllipseElement.setAttribute('cx', cx);
+      link.svgEllipseElement.setAttribute('cy', cy);
+      link.svgEllipseElement.setAttribute('rx', rx);
+      link.svgEllipseElement.setAttribute('ry', ry);
+      link.svgEllipseElement.setAttribute('transform', `rotate(${angle} ${cx} ${cy})`);
+    };
+    map.on('zoom move', onViewReset);
+
+    link._onViewReset = onViewReset;
+  }
+
+  // tiny helper to approximate a small lat/lng offset for ~1m
+  function destinationLatLng(latlng, latOffset) {
+    return L.latLng(latlng.lat + latOffset, latlng.lng);
+  }
+
+  // fetch elevation samples using Open-Elevation (best-effort). returns array of {latitude,longitude,elevation}
+  async function fetchElevations(aLL, bLL, samples=8) {
+    try {
+      const pts = [];
+      for (let i=0;i<=samples;i++) {
+        const t = i/samples;
+        pts.push({ lat: aLL.lat*(1-t) + bLL.lat*t, lon: aLL.lng*(1-t) + bLL.lng*t });
+      }
+      const locations = pts.map(p => `${p.lat},${p.lon}`).join('|');
+      const url = `https://api.open-elevation.com/api/v1/lookup?locations=${locations}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('elevation API failed');
+      const json = await res.json();
+      return json.results;
+    } catch (err) {
+      console.warn('Elevation fetch failed', err);
+      return null;
+    }
+  }
+
+  // map click to add tower
+  map.on('click', (e) => {
+    const freq = parseFloat(prompt('Tower frequency in GHz (e.g., 5):', '5')) || 5;
+    const t = addTower(e.latlng, freq);
+  });
+
+  // toolbar handlers
+  document.getElementById('clearAll').onclick = () => {
+    if (!confirm('Remove all towers and links?')) return;
+    for (let id of Array.from(links.keys())) removeLink(id);
+    for (let id of Array.from(towers.keys())) removeTower(id);
+  };
+  document.getElementById('sampleTowers').onclick = () => addSampleTowers();
+
+  function addSampleTowers() {
+    const sample = [
+      {lat: 28.7041, lng:77.1025, f:5}, // Delhi
+      {lat: 27.1751, lng:78.0421, f:5}, // Agra
+      {lat: 26.9124, lng:75.7873, f:3.5}, // Jaipur
+      {lat: 19.0760, lng:72.8777, f:5} // Mumbai
+    ];
+    sample.forEach(s => addTower(L.latLng(s.lat,s.lng), s.f));
+  }
+
+  // basic persistence: export/import JSON
+  function exportState() {
+    const state = { towers: [], links: [] };
+    for (let [id,t] of towers) state.towers.push({ id: t.id, latlng: t.latlng, freqGHz: t.freqGHz });
+    for (let [id,l] of links) state.links.push({ id: l.id, aId: l.aId, bId: l.bId });
+    return JSON.stringify(state, null, 2);
+  }
+
+  // keyboard shortcuts
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'e' && e.ctrlKey) { e.preventDefault(); prompt('Export JSON', exportState()); }
+    if (e.key === 'Escape') { clearLinkStart(); }
+  });
+
+  // initial sample
+  addSampleTowers();
+
+  </script>
+</body>
+</html>
